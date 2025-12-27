@@ -1,0 +1,225 @@
+I developed Oracle HRIE, which stands for Hospital Resource & Insurance Engine. It is a full-stack PL/SQL ERP system designed to handle complex hospital workflows.
+Unlike standard CRUD projects, I focused on 'Deep Code' logic. For example:
+I built a Concurrency Engine using Pessimistic Locking to prevent double-booking of appointments.
+I implemented a Finite State Machine to strictly manage bed lifecycles (Vacant to Occupied to Housekeeping).
+I designed a FEFO Algorithm (First-Expired-First-Out) for the pharmacy to ensure older medicines are sold first.
+The system is fully normalized and handles end-to-end billing aggregation automatically.
+
+
+____Module 1:
+
+Module 1 - Foundation & Patient Identity
+1. High-Level Overview
+Module 1 establishes the Foundational Data Architecture for the entire Hospital Resource & Insurance Engine (HRIE). Before building complex workflows like Insurance or Pharmacy, we first constructed a robust Master Data Management (MDM) layer. This module handles the creation of standardized 'Smart Keys' for patients (UHID) and enforces strict data integrity rules at the database level, ensuring that our foundation is solid enough to support high-volume transaction processing later.
+
+2. Architectural Decisions
+Instead of simple tables, I implemented enterprise-standard design patterns to ensure scalability and auditability:
+Smart Keys (UHID) over Simple Sequences:
+Concept: I moved away from simple numeric IDs (e.g., 101, 102) to meaningful Smart Keys.
+Implementation: I created a PL/SQL function FN_GENERATE_UHID that generates IDs like MUM-2025-1001.
+
+Why? This immediately tells a user the Location (Mumbai) and Registration Year (2025) just by looking at the ID, which is critical for multi-branch hospital operations.
+
+Logic Encapsulation:
+Concept: I used the 'SmartDB' pattern where the application layer (Java/APEX) never runs raw INSERT statements.
+Implementation: All logic is wrapped in a PL/SQL Package PKG_PATIENT_MGMT.
+
+This secures the database. The UI only calls PRC_REGISTER_PATIENT. If business rules change (e.g., duplicate checks), I only update the Package, not the UI code.
+
+Immutable Audit Trails:
+Concept: Auditing shouldn't be left to the application developer.
+Implementation: I attached Database Triggers (TRG_PATIENT_AUDIT) to the tables.
+
+Whether a record is updated via the App, a Batch Job, or a manual SQL fix, the LAST_UPDATED_BY and TIMESTAMP are captured automatically. You can never 'fake' an audit trail.
+
+3. Technical Deep Dive (The Objects)
+A. The Data Model (HMS_PATIENT_MASTER) "The table design focuses on Data Quality. I used Check Constraints to prevent 'dirty data' from ever entering the system:"
+CHECK (DATE_OF_BIRTH <= SYSDATE): Prevents future birthdates.
+CHECK (EMAIL LIKE '%@%'): Enforces basic format validity at the schema level.
+IS_ACTIVE Flag: Implements the Soft Delete pattern. In healthcare, we never physically delete patient history; we only mark it inactive.
+
+B. The Logic Core (PKG_PATIENT_MGMT) "This package handles the 'Heavy Lifting' of the module:"
+
+Concurrency Handling: It uses SEQ.NEXTVAL inside the logic flow to ensure that even if 100 receptionists register patients simultaneously, every UHID is unique and gap-free.
+
+Duplicate Prevention: Before insertion, the procedure performs a check on MOBILE_NO + FIRST_NAME. If a match is found, it raises a custom application error (-20001), preventing duplicate patient profiles—a common issue in hospital CRM systems.
+
+
+------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------------------------------------------------------------
+____Module 2:
+
+Module 2 - OPD & Appointment Scheduler
+1. High-Level Overview:
+In Module 2, we moved beyond simple data storage to building a Transactional Engine. The core challenge of a hospital appointment system is Time Management. Instead of creating millions of empty rows in a table for every possible 15-minute slot for the next 10 years (which is a poor design), I implemented a Rules-Based Architecture:
+
+The Rule: OPD_SCHEDULE_MASTER defines when a doctor is available (e.g., 'Mondays 9 AM to 1 PM').
+
+The Transaction: OPD_APPOINTMENTS records the actual booking. The system calculates availability dynamically in real-time, which saves massive amounts of storage and makes the system flexible."
+
+2. Key Technical Challenges Solved (The "Deep Code" Features)
+A. Concurrency & The "Double-Booking" Problem
+
+The Problem: In a high-load hospital, two receptionists might click "Book" for the same doctor at the same 9:00 AM slot at the exact same millisecond. Application-level checks (Java/PHP) often fail here due to 'Race Conditions'.
+
+My Solution (Database Hard Lock): I utilized a Composite Unique Constraint UK_DOC_SLOT on (DOCTOR_ID, APPOINTMENT_DATE, SLOT_START_TIME).
+
+Impact: This delegates locking to the Oracle Database Kernel. Even if 100 concurrent requests hit the server, the database guarantees that only one succeeds. The others receive a specific error (DUP_VAL_ON_INDEX), which my PL/SQL package catches and translates into a user-friendly "Slot already booked" message.
+
+B. Data Integrity via Regex
+The Problem: Time is often stored as text ('09:00'), leading to bad data like '25:99' or '9am'.
+
+My Solution: I implemented a Check Constraint with Regex at the table level: CHECK (REGEXP_LIKE(SLOT_START_TIME, '^([0-1][0-9]|2[0-3]):[0-5][0-9]$'))
+
+Impact: This ensures that no matter how the data is inserted (SQL Developer, App, API), it is mathematically impossible to store an invalid time format.
+
+3. Object-Level Deep Dive
+I. The Configuration Table (OPD_SCHEDULE_MASTER) "This is the 'Configuration' layer. It uses a Unique Constraint on (DOCTOR_ID, DAY_OF_WEEK) to enforce the business rule that a doctor can only have one shift configuration per day. This prevents conflicting rules (e.g., defining two different start times for Monday)."
+
+II. The Transaction Table (OPD_APPOINTMENTS) "This table stores the financial and operational snapshot of the booking.
+
+Fee Snapshotting: We store CONSULTATION_FEE in this table at the time of booking. If the doctor raises their price next month, historical appointments remain accurate for audit purposes.
+
+Token Generation: The column TOKEN_NUMBER represents the patient's queue position (1, 2, 3...). This is essentially a 'Daily Sequence' that resets every morning for every doctor."
+
+III. The Logic Core (PKG_APPOINTMENT_ENGINE) "The PL/SQL package acts as the 'Gatekeeper'. It enforces logic that cannot be handled by constraints alone:"
+
+Date-to-Day Conversion: It takes a specific date (e.g., 25-DEC-2025), determines it is a 'Thursday', and checks if the doctor works on Thursdays.
+
+Deep Detail: I used NLS_DATE_LANGUAGE=ENGLISH to ensuring the code doesn't crash if deployed on a server with French or German settings.
+
+Past Date Blocking: Strict logic IF TRUNC(p_req_date) < TRUNC(SYSDATE) prevents back-dated bookings, securing the audit trail.
+
+Token Logic: It uses MAX(TOKEN_NUMBER) + 1 logic specifically scoped to DOCTOR_ID and APPOINTMENT_DATE, ensuring every doctor has their own separate queue (Doctor A has Token 1, Doctor B has Token 1).
+
+-------------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------------------------------------------------------------
+____Module 3:
+
+
+1.Overview: The "Physical Asset" Challenge"In Module 3, we tackle the management of Finite Physical Resources (Hospital Beds). Unlike an appointment, which is just a time slot, a Bed is a physical asset that must be cleaned, maintained, and tracked strictly.To handle this, I implemented a Finite State Machine (FSM) architecture. A bed isn't just 'Available' or 'Not'; it cycles through strict states: VACANT-> OCCUPIED -> HOUSEKEEPING -> VACANT. This ensures operational reality aligns with the database state."
+
+2. Key Technical Challenges Solved (The "Deep Code" Features)
+A. Pessimistic Locking (SELECT ... FOR UPDATE)
+
+The Problem: In a busy hospital, two admins might try to assign the same ICU bed to two different emergency patients simultaneously. A standard SELECT check ("Is bed empty?") is insufficient because both users might see "Yes" at the same split second.
+
+My Solution: Inside the PRC_ADMIT_PATIENT procedure, I used: SELECT ... FROM ADT_BED_MASTER ... FOR UPDATE OF CURRENT_STATUS;
+
+Deep Insight: This creates a Row-Level Lock. If Admin A initiates the admission, the database physically freezes that specific bed's row. Admin B's transaction is forced to wait until Admin A commits or rolls back. This guarantees Zero Race Conditions for critical resources.
+
+B. Database Normalization (The Optimization)
+
+The Decision: During the architectural review, I removed the CURRENT_PATIENT_ID column from the ADT_BED_MASTER table.
+
+Why? Storing the Patient ID on the Bed table creates a risk of Data Anomaly. If ADT_ADMISSIONS says Patient X is in Bed 1, but ADT_BED_MASTER says Patient Y is in Bed 1, the system is broken.
+
+The Fix: I strictly normalized the design. The Bed table only knows if it is OCCUPIED. To find who is in it, we query the active record in ADT_ADMISSIONS. This creates a Single Source of Truth.
+
+3. Object-Level Deep Dive
+I. The State Machine Table (ADT_BED_MASTER) "This table represents the physical reality. I used a strict CHECK CONSTRAINT to enforce the lifecycle states (VACANT, OCCUPIED, HOUSEKEEPING). You physically cannot update a bed to a status like 'RESERVED' or 'DIRTY' because the database schema forbids it."
+
+II. The Financial Ledger (ADT_BED_MOVEMENT_LOG) "This is the most critical table for Billing.
+
+Concept: We don't just update the patient's location; we log the history of every move.
+
+Snapshotting: When a patient enters a bed, we snapshot the COST_PER_DAY into this log.
+
+Why? If the hospital raises ICU rates from ₹15,000 to ₹20,000 tomorrow, the patient who was admitted today is contractually protected at the old rate. The log preserves this financial contract."
+
+III. The Workflow Logic (PKG_IPD_ADMISSION) "The package orchestrates the lifecycle:"
+
+Admit: Locks the bed, validates it is VACANT, creates the Admission Header, and starts the Billing Clock.
+
+Transfer: This is a complex atomic transaction. It involves four distinct updates that must happen together:
+
+Stop the clock on Bed A (Old).
+
+Start the clock on Bed B (New).
+
+Mark Bed A as HOUSEKEEPING.
+
+Mark Bed B as OCCUPIED.
+
+If any one of these fails, the entire transfer rolls back.
+
+-------------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------------------------------------------------------------
+____Module 4:
+
+Module 4 - Pharmacy Engine & FEFO Logic
+1. High-Level Overview: The "Safety & Valuation" Challenge
+In Module 4, we built the Pharmacy Inventory Engine. Unlike a standard retail shop that uses FIFO (First-In, First-Out), a hospital pharmacy must strictly follow FEFO (First-Expired, First-Out). If we have two boxes of Paracetamol—one bought yesterday expiring next month, and one bought last year expiring tomorrow—we are legally and ethically required to sell the one expiring tomorrow first. My module automates this decision-making so the pharmacist doesn't have to manually check dates.
+
+2. Key Technical Challenges Solved (The "Deep Code" Features)
+A. The FEFO Algorithm (Automated Batch Selection)
+
+The Problem: A doctor prescribes "15 Strips of Paracetamol". The database shows we have 50 in stock. However, that stock is split across 3 different batches with different expiry dates.
+
+My Solution: I implemented a Cursor-Based Algorithm inside PRC_ISSUE_MEDICINE.
+
+It opens a cursor sorted by EXPIRY_DATE ASC.
+It loops through batches, draining the oldest/soonest-expiring batch first.
+It intelligently splits the line item: If Batch A has 10 and Batch B has 50, and I need 15, it takes 10 from A and 5 from B automatically.
+
+B. Granularity & Normalization
+The Problem: Many junior developers store QUANTITY in the ITEM_MASTER.
+
+My Solution: I separated the Definition (INV_ITEM_MASTER) from the Instance (INV_ITEM_BATCHES).
+
+ITEM_MASTER holds static data (Name, Generic Name).
+
+INV_ITEM_BATCHES holds dynamic data (Expiry, Current Qty, Price).
+
+Deep Insight: This allows us to have different prices for the same item. Batch A might have been bought for ₹10, and Batch B for ₹12. My system tracks this financial variance accurately.
+
+C. Strict Concurrency Control (FOR UPDATE)
+The Problem: Two pharmacists at different counters try to sell the last remaining strip of a critical drug simultaneously.
+My Solution: Inside the FEFO cursor, I used FOR UPDATE.
+
+When the system identifies "Batch A" as the candidate for sale, it locks that row.
+
+If another transaction tries to access Batch A, it waits. It does not skip it (because skipping would mean selling fresher stock, violating FEFO). This ensures inventory counts never go negative.
+
+-------------------------------------------------------------------------------------------------------------------------------------------
+-------------------------------------------------------------------------------------------------------------------------------------------
+____Module 5:
+
+
+1.Overview: The "Aggregator" Pattern
+Module 5 is unique. Unlike Modules 2, 3, and 4 which create operational data (Appointments, Admissions, Inventory), Module 5 is an Aggregator. Its job is to 'harvest' costs. It looks at the Bed Logs from Module 3 to calculate room rent, and the Stock Ledger from Module 4 to calculate medicine costs. It then combines them into a single FIN_BILL_HEADER. This separation of concerns ensures that the Billing Team never manually enters data; the bill is purely a derivative of operational reality.
+
+2. Key Technical Challenges Solved (The "Deep Code" Features)
+A. Multi-Source Cost Integration
+The Problem: Bed charges are Time-Based (Start Time to End Time), while Pharmacy charges are Transaction-Based (Quantity × Unit Price). They exist in completely different schemas.
+
+My Solution: Inside PRC_GENERATE_IPD_BILL, I implemented two distinct aggregation loops:
+
+Loop A (Time): Queries ADT_BED_MOVEMENT_LOG. It calculates (CheckOut - CheckIn) * CostPerDay.
+
+Loop B (Material): Queries INV_MATERIAL_TRANSACTIONS. It calculates SUM(Qty * MRP).
+
+These loops feed into a common target table FIN_BILL_DETAILS, utilizing a polymorphic column SOURCE_REF_ID to link back to the original source (Bed ID or Batch ID) for auditability.
+
+B. The "Split Liability" Workflow (Insurance)
+The Problem: In healthcare, the "Bill Amount" is rarely what the patient actually pays. If the bill is ₹100,000 and Insurance approves ₹80,000, the patient only owes ₹20,000.
+
+My Solution: I implemented an Adjudication Procedure (PRC_PROCESS_CLAIM).
+
+It doesn't just record the insurance approval.
+It automatically triggers a financial adjustment: UPDATE FIN_BILL_HEADERS SET NET_PAYABLE = TOTAL - APPROVED_AMT.
+This keeps the 'Accounts Receivable' accurate in real-time.
+
+
+3. Script-by-Script Logic Explanation
+Script 1: Tables (FIN_BILL_HEADERS & DETAILS) "I used a classic Header-Detail pattern here.
+FIN_BILL_HEADERS: Contains the summary (Total, Discount, Net Payable). I added a CHECK constraint on PAYMENT_STATUS to track the lifecycle:
+pending->CLAIM_SUBMITTED -> PARTIAL -> PAID.
+
+FIN_BILL_DETAILS: This table is highly normalized. Instead of having columns like MEDICINE_COST or ROOM_RENT, I used a generic SERVICE_TYPE column. This makes the system extensible; if we add 'Ambulance Charges' later, we don't need to change the table structure, just insert a new row type."
+
+Script 3: The Engine (PKG_BILLING_ENGINE) "The core logic resides in PRC_GENERATE_IPD_BILL.
+
+Null Handling: I specifically handled the 'Interim Bill' scenario. If a patient is currently admitted, their CHECK_OUT_TIME is NULL. My code handles this by NVL(CHECK_OUT_TIME, SYSDATE), allowing us to generate an accurate bill right now even before discharge.
+
+Day Calculation: I used CEIL(End - Start) to round up partial days. If a patient stays for 26 hours, hospitals typically charge for 2 days. My logic enforces this revenue rule programmatically."
